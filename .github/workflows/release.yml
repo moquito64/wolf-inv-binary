@@ -1,0 +1,56 @@
+# .github/workflows/release.yml
+
+name: Release Go Binary
+
+# This workflow runs when a new tag (like v1.0.0) is pushed to the repository.
+on:
+  push:
+    tags:
+      - 'v*' # Trigger on version tags like v1.0, v1.2.3, etc.
+
+jobs:
+  build-and-release:
+    name: Build and Release
+    runs-on: ubuntu-latest # The type of machine to run the job on.
+    
+    strategy:
+      matrix:
+        # Define the platforms you want to build for.
+        # go tool dist list' shows all possible GOOS/GOARCH combinations.
+        goos: [linux]
+        goarch: [amd64, arm]
+
+    steps:
+      # Step 1: Check out your repository's code.
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # Step 2: Set up the Go environment on the runner.
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22' # Specify your Go version.
+
+      # Step 3: Build the binary for the specific OS/architecture from the matrix.
+      - name: Build
+        # GOOS and GOARCH are environment variables Go uses for cross-compilation.
+        # The values come from the 'matrix' defined above.
+        # The output binary will be named 'my-app-linux-amd64', 'my-app-linux-arm', etc.
+        run: go build -v -o wacinv-${{ matrix.goos }}-${{ matrix.goarch }} ./...
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          
+      # Step 4: Create the release and upload the compiled binary as an asset.
+      # This step uses a popular community action to handle GitHub Releases.
+      # It will run for each combination in the matrix, uploading one asset per run.
+      - name: Create Release and Upload Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          # This creates a draft release. Set to 'false' to publish immediately.
+          draft: false
+          # The body of the release. You can use this to write release notes.
+          body: "This is an automated release."
+          # This names the file that gets uploaded to the release.
+          # Example: my-app-linux-amd64.tar.gz
+          files: wacinv-${{ matrix.goos }}-${{ matrix.goarch }}

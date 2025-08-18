@@ -1,0 +1,4 @@
+{
+  "apiBaseURL": "https://api-endpoint-url-goes-here/api",
+  "apiToken": "secret-api-token-goes-here"
+}
