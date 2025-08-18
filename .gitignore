@@ -7,7 +7,7 @@ config.json
 *.dylib
 *.test
 *.out
-
+*.old
 # Output of the go coverage tool
 *.coverprofile
 
