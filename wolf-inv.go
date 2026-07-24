@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -66,6 +68,11 @@ func loadConfig() (*Config, error) {
 	return &config, nil
 }
 
+// httpClient is used for all API calls so a hung server can't block the UI forever.
+var httpClient = &http.Client{Timeout: 10 * time.Second}
+
+const pollInterval = 30 * time.Second
+
 // --- MODEL ---
 
 // Server represents a single server entry from the API.
@@ -115,7 +122,7 @@ func (d itemDelegate) Render(w io.Writer, m list.Model, index int, item list.Ite
 	if !ok {
 		return
 	}
-	str := fmt.Sprintf("%s", s)
+	str := string(s)
 	if index == m.Index() {
 		fmt.Fprintf(w, "> %s", lipgloss.NewStyle().Foreground(lipgloss.Color("#5696E3")).Render(str))
 	} else {
@@ -156,7 +163,7 @@ type model struct {
 // Init runs any initial commands for the app.
 func (m model) Init() tea.Cmd {
 	// Pass the API token to the initial fetch command
-	return tea.Batch(fetchServers(m.apiBaseURL, m.apiToken), pollForUpdates(30*time.Second))
+	return tea.Batch(fetchServers(m.apiBaseURL, m.apiToken), pollForUpdates(pollInterval))
 }
 
 // --- UPDATE ---
@@ -167,9 +174,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	// Global handling for window size changes
 	if size, ok := msg.(tea.WindowSizeMsg); ok {
-		m.table, cmd = m.table.Update(size)
-		m.statusList, _ = m.statusList.Update(size)
-		return m, cmd
+		m.table.SetWidth(size.Width)
+		m.table.SetHeight(max(size.Height-8, 3))
+		m.statusList.SetSize(size.Width, 8)
+		return m, nil
+	}
+
+	// Global handling for the poll tick so the 30s refresh keeps running
+	// regardless of which state the tick lands in. tea.Tick fires only once,
+	// so it must be re-armed here every time.
+	if _, ok := msg.(fetchServersMsg); ok {
+		if m.state == Viewing {
+			return m, tea.Batch(fetchServers(m.apiBaseURL, m.apiToken), pollForUpdates(pollInterval))
+		}
+		return m, pollForUpdates(pollInterval)
 	}
 
 	// Stop any existing message timer if a new key is pressed
@@ -215,7 +233,7 @@ func updateViewing(msg tea.Msg, m model) (tea.Model, tea.Cmd) {
 			m.textInput.Placeholder = "Name"
 			m.textInput.Focus()
 			m.textInput.SetValue("")
-			m.message = "Adding new server (Step 1 of 4):"
+			m.message = m.formStepMessage(1)
 			m.currentMsgStyle = m.messageStyle
 			return m, textinput.Blink
 		case "d":
@@ -245,7 +263,7 @@ func updateViewing(msg tea.Msg, m model) (tea.Model, tea.Cmd) {
 					m.textInput.Placeholder = "Name"
 					m.textInput.Focus()
 					m.textInput.SetValue(m.currentServer.Name)
-					m.message = "Editing server (Step 1 of 4):"
+					m.message = m.formStepMessage(1)
 					m.currentMsgStyle = m.messageStyle
 					return m, textinput.Blink
 				}
@@ -266,9 +284,6 @@ func updateViewing(msg tea.Msg, m model) (tea.Model, tea.Cmd) {
 		m.err = msg
 		m.message = m.err.Error()
 		m.currentMsgStyle = m.cancelStyle // Use cancel style for errors
-	case fetchServersMsg:
-		// Pass the token for polling updates
-		return m, fetchServers(m.apiBaseURL, m.apiToken)
 	case clearMessage:
 		m.currentMsgStyle = m.messageStyle
 	}
@@ -291,24 +306,33 @@ func updateAddingEditing(msg tea.Msg, m model) (tea.Model, tea.Cmd) {
 	case InputName, InputIP, InputLocation:
 		m.textInput, cmd = m.textInput.Update(msg)
 		if keyMsg, ok := msg.(tea.KeyMsg); ok && keyMsg.String() == "enter" {
+			value := strings.TrimSpace(m.textInput.Value())
 			switch m.addingState {
 			case InputName:
-				m.currentServer.Name = m.textInput.Value()
+				if value == "" {
+					m.message = m.formStepMessage(1) + " (name is required)"
+					return m, nil
+				}
+				m.currentServer.Name = value
 				m.addingState = InputIP
 				m.textInput.Placeholder = "IP Address"
 				m.textInput.SetValue(m.currentServer.IP)
-				m.message = "Adding new server (Step 2 of 4):"
+				m.message = m.formStepMessage(2)
 			case InputIP:
-				m.currentServer.IP = m.textInput.Value()
+				if value == "" {
+					m.message = m.formStepMessage(2) + " (IP is required)"
+					return m, nil
+				}
+				m.currentServer.IP = value
 				m.addingState = InputLocation
 				m.textInput.Placeholder = "Location"
 				m.textInput.SetValue(m.currentServer.Location)
-				m.message = "Adding new server (Step 3 of 4):"
+				m.message = m.formStepMessage(3)
 			case InputLocation:
-				m.currentServer.Location = m.textInput.Value()
+				m.currentServer.Location = value
 				m.addingState = InputStatus
 				m.textInput.Blur()
-				m.message = "Adding new server (Step 4 of 4):"
+				m.message = m.formStepMessage(4)
 			}
 			return m, textinput.Blink
 		}
@@ -500,6 +524,15 @@ func (m *model) updateTable() {
 	m.table.SetStyles(s)
 }
 
+// formStepMessage builds the step banner for the add/edit form based on the current state.
+func (m model) formStepMessage(step int) string {
+	verb := "Adding new"
+	if m.state == Editing {
+		verb = "Editing"
+	}
+	return fmt.Sprintf("%s server (Step %d of 4):", verb, step)
+}
+
 // setTempMessage sets a message with a specific style and a timer to reset it.
 func (m *model) setTempMessage(style lipgloss.Style, message string) {
 	m.message = message
@@ -532,7 +565,7 @@ func fetchServers(apiURL, apiToken string) tea.Cmd {
 		// Set the Authorization header
 		req.Header.Set("Authorization", "Bearer "+apiToken)
 
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := httpClient.Do(req)
 		if err != nil {
 			return errMsg{err: fmt.Errorf("could not connect to API: %w", err)}
 		}
@@ -545,6 +578,8 @@ func fetchServers(apiURL, apiToken string) tea.Cmd {
 		if err := json.NewDecoder(resp.Body).Decode(&servers); err != nil {
 			return errMsg{err: fmt.Errorf("failed to decode JSON: %w", err)}
 		}
+		// The API is backed by an unordered store, so sort for a stable table.
+		sort.Slice(servers, func(i, j int) bool { return servers[i].Name < servers[j].Name })
 		return serverMsg{servers: servers}
 	}
 }
@@ -552,7 +587,10 @@ func fetchServers(apiURL, apiToken string) tea.Cmd {
 // Updated addOrEditServer to accept and use the API token
 func addOrEditServer(apiURL, apiToken string, serverData Server) tea.Cmd {
 	return func() tea.Msg {
-		jsonData, _ := json.Marshal(serverData)
+		jsonData, err := json.Marshal(serverData)
+		if err != nil {
+			return errMsg{err: fmt.Errorf("could not encode server data: %w", err)}
+		}
 		req, err := http.NewRequest("POST", apiURL+"/report", bytes.NewBuffer(jsonData))
 		if err != nil {
 			return errMsg{err: fmt.Errorf("could not create request: %w", err)}
@@ -561,7 +599,7 @@ func addOrEditServer(apiURL, apiToken string, serverData Server) tea.Cmd {
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+apiToken)
 
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := httpClient.Do(req)
 		if err != nil {
 			return errMsg{err: fmt.Errorf("failed to send request: %w", err)}
 		}
@@ -579,14 +617,15 @@ func addOrEditServer(apiURL, apiToken string, serverData Server) tea.Cmd {
 // Updated deleteServer to accept and use the API token
 func deleteServer(apiURL, apiToken, serverName string) tea.Cmd {
 	return func() tea.Msg {
-		req, err := http.NewRequest("DELETE", fmt.Sprintf("%s/delete/%s", apiURL, serverName), nil)
+		// Escape the name so servers named with spaces, slashes, etc. still delete correctly.
+		req, err := http.NewRequest("DELETE", fmt.Sprintf("%s/delete/%s", apiURL, url.PathEscape(serverName)), nil)
 		if err != nil {
 			return errMsg{err: fmt.Errorf("could not create request: %w", err)}
 		}
 		// Set the Authorization header
 		req.Header.Set("Authorization", "Bearer "+apiToken)
 
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := httpClient.Do(req)
 		if err != nil {
 			return errMsg{err: fmt.Errorf("failed to send request: %w", err)}
 		}
@@ -639,8 +678,8 @@ func main() {
 		otherStyle:      lipgloss.NewStyle().Foreground(lipgloss.Color("11")),
 		tableStyle:      lipgloss.NewStyle().Border(lipgloss.NormalBorder()).BorderForeground(lipgloss.Color("6")).Padding(1),
 		messageStyle:    messageStyle,
-		successStyle:    messageStyle.Copy().Foreground(lipgloss.Color("10")), // Green
-		cancelStyle:     messageStyle.Copy().Foreground(lipgloss.Color("11")), // Yellow
+		successStyle:    messageStyle.Foreground(lipgloss.Color("10")), // Green
+		cancelStyle:     messageStyle.Foreground(lipgloss.Color("11")), // Yellow
 		helpStyle:       lipgloss.NewStyle().Padding(1, 2).Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("6")),
 		currentMsgStyle: messageStyle,
 	}
