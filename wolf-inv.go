@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/list"
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/table"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -141,12 +142,14 @@ type model struct {
 	table         table.Model
 	textInput     textinput.Model
 	statusList    list.Model
+	spinner       spinner.Model
+	width         int
+	height        int
 	currentServer Server
 	deleteTarget  string
 	apiBaseURL    string
 	apiToken      string // Added field to store the API token
 	// Styles
-	spinnerStyle    lipgloss.Style
 	headerStyle     lipgloss.Style
 	onlineStyle     lipgloss.Style
 	offlineStyle    lipgloss.Style
@@ -156,6 +159,10 @@ type model struct {
 	successStyle    lipgloss.Style
 	cancelStyle     lipgloss.Style
 	helpStyle       lipgloss.Style
+	helpKeyStyle    lipgloss.Style
+	helpDescStyle   lipgloss.Style
+	formStyle       lipgloss.Style
+	dangerStyle     lipgloss.Style
 	currentMsgStyle lipgloss.Style
 	messageTimer    *time.Timer
 }
@@ -163,7 +170,7 @@ type model struct {
 // Init runs any initial commands for the app.
 func (m model) Init() tea.Cmd {
 	// Pass the API token to the initial fetch command
-	return tea.Batch(fetchServers(m.apiBaseURL, m.apiToken), pollForUpdates(pollInterval))
+	return tea.Batch(fetchServers(m.apiBaseURL, m.apiToken), pollForUpdates(pollInterval), m.spinner.Tick)
 }
 
 // --- UPDATE ---
@@ -172,11 +179,23 @@ func (m model) Init() tea.Cmd {
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 
-	// Global handling for window size changes
+	// Global handling for window size changes: refit the table columns and
+	// widgets to the new terminal dimensions.
 	if size, ok := msg.(tea.WindowSizeMsg); ok {
-		m.table.SetWidth(size.Width)
-		m.table.SetHeight(max(size.Height-8, 3))
-		m.statusList.SetSize(size.Width, 8)
+		m.width, m.height = size.Width, size.Height
+		m.updateTable()
+		m.table.SetHeight(max(size.Height-10, 3))
+		m.statusList.SetSize(min(size.Width-8, 40), 8)
+		return m, nil
+	}
+
+	// Animate the spinner only while something is loading; each loading=true
+	// site restarts the tick loop with m.spinner.Tick.
+	if tick, ok := msg.(spinner.TickMsg); ok {
+		if m.loading {
+			m.spinner, cmd = m.spinner.Update(tick)
+			return m, cmd
+		}
 		return m, nil
 	}
 
@@ -224,7 +243,7 @@ func updateViewing(msg tea.Msg, m model) (tea.Model, tea.Cmd) {
 			m.message = "Refreshing data..."
 			m.currentMsgStyle = m.messageStyle
 			// Pass the token when refreshing
-			return m, fetchServers(m.apiBaseURL, m.apiToken)
+			return m, tea.Batch(fetchServers(m.apiBaseURL, m.apiToken), m.spinner.Tick)
 		case "a":
 			m.state = Adding
 			m.table.Blur()
@@ -238,9 +257,8 @@ func updateViewing(msg tea.Msg, m model) (tea.Model, tea.Cmd) {
 			return m, textinput.Blink
 		case "d":
 			if len(m.servers) > 0 {
-				selectedRow := m.table.SelectedRow()
-				if len(selectedRow) > 0 {
-					m.deleteTarget = selectedRow[0]
+				if cursor := m.table.Cursor(); cursor >= 0 && cursor < len(m.servers) {
+					m.deleteTarget = m.servers[cursor].Name
 					m.state = Deleting
 					m.message = ""
 				}
@@ -248,18 +266,11 @@ func updateViewing(msg tea.Msg, m model) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "e":
 			if len(m.servers) > 0 {
-				selectedRow := m.table.SelectedRow()
-				if len(selectedRow) > 0 {
+				if cursor := m.table.Cursor(); cursor >= 0 && cursor < len(m.servers) {
 					m.state = Editing
 					m.table.Blur()
 					m.addingState = InputName
-					m.currentServer = Server{
-						Name:       selectedRow[0],
-						IP:         selectedRow[1],
-						Location:   selectedRow[2],
-						Status:     strings.TrimSpace(selectedRow[3]),
-						LastReport: selectedRow[4],
-					}
+					m.currentServer = m.servers[cursor]
 					m.textInput.Placeholder = "Name"
 					m.textInput.Focus()
 					m.textInput.SetValue(m.currentServer.Name)
@@ -353,7 +364,7 @@ func updateAddingEditing(msg tea.Msg, m model) (tea.Model, tea.Cmd) {
 				m.table.Focus()
 				m.setTempMessage(m.successStyle, "Submitting server data...")
 				// Pass the token when adding/editing
-				return m, addOrEditServer(m.apiBaseURL, m.apiToken, m.currentServer)
+				return m, tea.Batch(addOrEditServer(m.apiBaseURL, m.apiToken, m.currentServer), m.spinner.Tick)
 			case "n", "N", "esc":
 				m.state = Viewing
 				m.table.Focus()
@@ -374,7 +385,7 @@ func updateDeleting(msg tea.Msg, m model) (tea.Model, tea.Cmd) {
 			m.table.Focus()
 			m.setTempMessage(m.successStyle, fmt.Sprintf("Deleting server '%s'...", m.deleteTarget))
 			// Pass the token when deleting
-			return m, deleteServer(m.apiBaseURL, m.apiToken, m.deleteTarget)
+			return m, tea.Batch(deleteServer(m.apiBaseURL, m.apiToken, m.deleteTarget), m.spinner.Tick)
 		case "n", "N", "esc":
 			m.state = Viewing
 			m.table.Focus()
@@ -401,10 +412,14 @@ func (m model) View() string {
 	}
 
 	s := ""
-	s += m.headerStyle.Render("Server Inventory Dashboard") + "\n\n"
+	header := m.headerStyle.Render(" Server Inventory ")
+	if summary := m.summaryLine(); summary != "" {
+		header += "  " + summary
+	}
+	s += header + "\n\n"
 
 	if m.loading {
-		s += m.spinnerStyle.Render("⠋") + " Loading..."
+		s += m.spinner.View() + m.messageStyle.Render(" Loading...")
 	} else {
 		s += m.currentMsgStyle.Render(m.message)
 	}
@@ -416,10 +431,58 @@ func (m model) View() string {
 	case Adding, Editing:
 		s += m.addingEditingView()
 	case Deleting:
-		s += fmt.Sprintf("Are you sure you want to delete '%s'?\n\n", m.deleteTarget) + m.messageStyle.Render("Press 'y' to confirm, 'n' or 'Esc' to cancel.")
+		s += m.deletingView()
 	}
 
 	return s
+}
+
+// summaryLine renders a compact online/offline/other count under the header.
+func (m model) summaryLine() string {
+	if len(m.servers) == 0 {
+		return ""
+	}
+	online, offline, other := 0, 0, 0
+	for _, s := range m.servers {
+		switch s.Status {
+		case "Online":
+			online++
+		case "Offline":
+			offline++
+		default:
+			other++
+		}
+	}
+	parts := []string{m.helpDescStyle.Render(fmt.Sprintf("%d servers", len(m.servers)))}
+	if online > 0 {
+		parts = append(parts, m.onlineStyle.Render(fmt.Sprintf("● %d online", online)))
+	}
+	if offline > 0 {
+		parts = append(parts, m.offlineStyle.Render(fmt.Sprintf("● %d offline", offline)))
+	}
+	if other > 0 {
+		parts = append(parts, m.otherStyle.Render(fmt.Sprintf("● %d other", other)))
+	}
+	return strings.Join(parts, m.helpDescStyle.Render(" · "))
+}
+
+// helpBar renders alternating key/description pairs as a styled hint bar.
+func (m model) helpBar(pairs ...string) string {
+	var b strings.Builder
+	for i := 0; i+1 < len(pairs); i += 2 {
+		if i > 0 {
+			b.WriteString(m.helpDescStyle.Render("  ·  "))
+		}
+		b.WriteString(m.helpKeyStyle.Render(pairs[i]))
+		b.WriteString(m.helpDescStyle.Render(" " + pairs[i+1]))
+	}
+	return b.String()
+}
+
+// deletingView renders the delete confirmation as a warning panel.
+func (m model) deletingView() string {
+	warning := fmt.Sprintf("Delete server '%s'?\n\nThis cannot be undone.", m.deleteTarget)
+	return m.dangerStyle.Render(warning) + "\n\n" + m.helpBar("y", "confirm", "n/esc", "cancel")
 }
 
 // viewingView renders the main table.
@@ -446,11 +509,8 @@ func (m model) viewingView() string {
 				default:
 					statusStyle = m.otherStyle
 				}
-				paddedStatus := server.Status
-				if len(paddedStatus) < 12 {
-					paddedStatus = paddedStatus + strings.Repeat(" ", 12-len(paddedStatus))
-				}
-				coloredStatus := statusStyle.Render(server.Status)
+				paddedStatus := paddedStatusCell(server.Status)
+				coloredStatus := statusStyle.Render("● " + server.Status)
 				line = strings.Replace(line, paddedStatus, coloredStatus, 1)
 				if serverIndex%2 == 1 && serverIndex != selectedRowIndex {
 					line = lipgloss.NewStyle().Background(lipgloss.Color("236")).Render(line)
@@ -463,58 +523,94 @@ func (m model) viewingView() string {
 	} else {
 		s += "No servers in inventory. Press 'a' to add one."
 	}
-	s += "\n\n" + m.messageStyle.Render("'a' add | 'd' delete | 'e' edit | '?' help | 'q' quit")
+	s += "\n\n" + m.helpBar("a", "add", "e", "edit", "d", "delete", "r", "refresh", "?", "help", "q", "quit")
 	return s
 }
 
 // addingEditingView renders the form for adding or editing a server.
 func (m model) addingEditingView() string {
-	s := ""
+	var body, hints string
 	switch m.addingState {
 	case InputName, InputIP, InputLocation:
-		s += fmt.Sprintf("Enter %s:\n\n%s", m.textInput.Placeholder, m.textInput.View())
-		s += "\n\n" + m.messageStyle.Render("Press 'Enter' to confirm, 'Esc' to cancel.")
+		body = fmt.Sprintf("Enter %s\n\n%s", m.textInput.Placeholder, m.textInput.View())
+		hints = m.helpBar("enter", "next", "esc", "cancel")
 	case InputStatus:
-		s += fmt.Sprintf("Select a Status:\n\n%s", m.statusList.View())
-		s += "\n\n" + m.messageStyle.Render("Press 'Enter' to confirm, 'Esc' to cancel.")
+		body = m.statusList.View()
+		hints = m.helpBar("↑/↓", "select", "enter", "next", "esc", "cancel")
 	case Confirm:
-		s += fmt.Sprintf("Confirm entry?\n\n  Name:     %s\n  IP:       %s\n  Location: %s\n  Status:   %s",
-			m.currentServer.Name, m.currentServer.IP, m.currentServer.Location, m.currentServer.Status)
-		s += "\n\n" + m.messageStyle.Render("Press 'y' to submit, 'n' or 'Esc' to cancel.")
+		label := m.helpDescStyle
+		body = fmt.Sprintf("Confirm entry?\n\n  %s %s\n  %s %s\n  %s %s\n  %s %s",
+			label.Render("Name:    "), m.currentServer.Name,
+			label.Render("IP:      "), m.currentServer.IP,
+			label.Render("Location:"), m.currentServer.Location,
+			label.Render("Status:  "), m.currentServer.Status)
+		hints = m.helpBar("y", "submit", "n/esc", "cancel")
 	}
-	return s
+	return m.formStyle.Render(body) + "\n\n" + hints
 }
 
 // helpView renders the help screen.
 func (m model) helpView() string {
-	return m.helpStyle.Render(
-		"--- Help ---\n\n" +
-			"  a: Add a new server\n" +
-			"  e: Edit selected server\n" +
-			"  d: Delete selected server\n" +
-			"  r: Refresh server list\n" +
-			"  ?: Show this help menu\n" +
-			"  q: Quit the application\n\n" +
-			"Press any key to return to the main view.",
-	)
+	keys := [][2]string{
+		{"a", "Add a new server"},
+		{"e", "Edit selected server"},
+		{"d", "Delete selected server"},
+		{"r", "Refresh server list"},
+		{"↑/↓", "Move selection"},
+		{"?", "Show this help menu"},
+		{"q", "Quit the application"},
+	}
+	var b strings.Builder
+	b.WriteString(m.headerStyle.Render(" Help ") + "\n\n")
+	for _, k := range keys {
+		b.WriteString(fmt.Sprintf("  %s  %s\n", m.helpKeyStyle.Render(fmt.Sprintf("%-4s", k[0])), m.helpDescStyle.Render(k[1])))
+	}
+	b.WriteString("\n" + m.messageStyle.Render("Press any key to return."))
+	return m.helpStyle.Render(b.String())
 }
 
 // --- UTILITIES ---
 
-// updateTable updates the table model with new server data.
-func (m *model) updateTable() {
-	columns := []table.Column{
-		{Title: "Name", Width: 20}, {Title: "IP Address", Width: 18},
-		{Title: "Location", Width: 18}, {Title: "Status", Width: 12},
-		{Title: "Last Report", Width: 35},
+// paddedStatusCell builds the plain status cell text ("● Online" padded to the
+// column width). viewingView relies on producing this exact string so it can
+// swap it for a colored version in the rendered table output.
+func paddedStatusCell(status string) string {
+	s := "● " + status
+	if w := lipgloss.Width(s); w < 14 {
+		s += strings.Repeat(" ", 14-w)
 	}
+	return s
+}
+
+// updateTable updates the table model with new server data and fits the
+// columns to the current terminal width.
+func (m *model) updateTable() {
+	// Horizontal chrome around column content: tableStyle border+padding (4)
+	// plus the table's own per-column cell padding (2 x 5 columns).
+	avail := m.width - 14
+	if m.width == 0 {
+		avail = 105 // no WindowSizeMsg seen yet; use the old fixed layout
+	}
+	avail = min(max(avail, 62), 140)
+
+	// Status and IP are fixed-width; Name, Location, and Last Report share
+	// the rest. Status must stay >= 14 so paddedStatusCell isn't truncated,
+	// which would break the color-swap in viewingView.
+	statusW, ipW := 14, 18
+	rest := avail - statusW - ipW
+	nameW := rest * 30 / 100
+	locW := rest * 25 / 100
+	lastW := rest - nameW - locW
+
+	columns := []table.Column{
+		{Title: "Name", Width: nameW}, {Title: "IP Address", Width: ipW},
+		{Title: "Location", Width: locW}, {Title: "Status", Width: statusW},
+		{Title: "Last Report", Width: lastW},
+	}
+	m.table.SetWidth(avail + 10)
 	rows := []table.Row{}
 	for _, server := range m.servers {
-		status := server.Status
-		if len(status) < 12 {
-			status = status + strings.Repeat(" ", 12-len(status))
-		}
-		rows = append(rows, table.Row{server.Name, server.IP, server.Location, status, server.LastReport})
+		rows = append(rows, table.Row{server.Name, server.IP, server.Location, paddedStatusCell(server.Status), server.LastReport})
 	}
 	m.table.SetColumns(columns)
 	m.table.SetRows(rows)
@@ -646,6 +742,15 @@ func pollForUpdates(d time.Duration) tea.Cmd {
 	})
 }
 
+// newFormInput builds the shared form text input with a stable width so the
+// form panel doesn't collapse around short placeholder text.
+func newFormInput() textinput.Model {
+	ti := textinput.New()
+	ti.Width = 36
+	ti.CharLimit = 64
+	return ti
+}
+
 // --- MAIN ---
 
 var p *tea.Program
@@ -661,6 +766,11 @@ func main() {
 
 	// Initialize styles
 	messageStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("7")).Italic(true)
+	accent := lipgloss.Color("99")
+
+	sp := spinner.New()
+	sp.Spinner = spinner.Dot
+	sp.Style = lipgloss.NewStyle().Foreground(accent)
 
 	m := model{
 		apiBaseURL:      config.ApiBaseURL,
@@ -669,18 +779,22 @@ func main() {
 		message:         "Initializing...",
 		state:           Viewing,
 		table:           table.New(),
-		textInput:       textinput.New(),
+		textInput:       newFormInput(),
 		statusList:      list.New(items, itemDelegate{}, 0, 0),
-		spinnerStyle:    lipgloss.NewStyle().Foreground(lipgloss.Color("12")),
-		headerStyle:     lipgloss.NewStyle().Foreground(lipgloss.Color("3")).Bold(true).MarginBottom(1),
+		spinner:         sp,
+		headerStyle:     lipgloss.NewStyle().Foreground(lipgloss.Color("229")).Background(accent).Bold(true),
 		onlineStyle:     lipgloss.NewStyle().Foreground(lipgloss.Color("10")),
 		offlineStyle:    lipgloss.NewStyle().Foreground(lipgloss.Color("9")),
 		otherStyle:      lipgloss.NewStyle().Foreground(lipgloss.Color("11")),
-		tableStyle:      lipgloss.NewStyle().Border(lipgloss.NormalBorder()).BorderForeground(lipgloss.Color("6")).Padding(1),
+		tableStyle:      lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("6")).Padding(1),
 		messageStyle:    messageStyle,
 		successStyle:    messageStyle.Foreground(lipgloss.Color("10")), // Green
 		cancelStyle:     messageStyle.Foreground(lipgloss.Color("11")), // Yellow
 		helpStyle:       lipgloss.NewStyle().Padding(1, 2).Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("6")),
+		helpKeyStyle:    lipgloss.NewStyle().Foreground(accent).Bold(true),
+		helpDescStyle:   lipgloss.NewStyle().Foreground(lipgloss.Color("241")),
+		formStyle:       lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(accent).Padding(1, 2).Width(46),
+		dangerStyle:     lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("9")).Foreground(lipgloss.Color("9")).Padding(1, 2),
 		currentMsgStyle: messageStyle,
 	}
 	m.statusList.Title = "Select Server Status"
